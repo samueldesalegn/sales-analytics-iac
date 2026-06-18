@@ -1,0 +1,26 @@
+version = 0.1
+
+[dev.global.parameters]
+stack_name = "salespractice-dev"
+
+[dev.deploy.parameters]
+stack_name = "salespractice-dev"
+resolve_s3 = true
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=dev ProjectName=salespractice"
+
+[staging.deploy.parameters]
+stack_name = "salespractice-staging"
+resolve_s3 = true
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=staging ProjectName=salespractice"
+
+[prod.deploy.parameters]
+stack_name = "salespractice-prod"
+resolve_s3 = true
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=prod ProjectName=salespractice"
+confirm_changeset = true

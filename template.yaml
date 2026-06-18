@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Sales analytics backend — ingestion through the Athena query layer, as code.
+  Raw S3 -> Glue ETL -> curated S3 -> Glue Data Catalog -> Athena workgroup,
+  named queries, and a Lambda data-quality gate. QuickSight and the embed are
+  intentionally OUT of scope (configured separately, outside this template).
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: salespractice
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+    Environment:
+      Variables:
+        ENV: !Ref Environment
+
+Resources:
+
+  # =========================================================
+  # 1. Storage — raw landing, curated zone, Athena results
+  # =========================================================
+  RawZoneBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-raw-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms }
+
+  CuratedZoneBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-curated-${Environment}-${AWS::AccountId}"
+      # ... same encryption + public-access block as RawZoneBucket
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${Environment}-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # =========================================================
+  # 2. Catalog — Glue database + external table over Parquet
+  # =========================================================
+  AnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_${Environment}"
+
+  SalesCuratedTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AnalyticsDatabase
+      TableInput:
+        Name: sales_curated
+        TableType: EXTERNAL_TABLE
+        Parameters: { classification: parquet }
+        StorageDescriptor:
+          Location: !Sub "s3://${CuratedZoneBucket}/sales/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: sale_id,   Type: string }
+            - { Name: sale_date, Type: date }
+            - { Name: region,    Type: string }
+            - { Name: product,   Type: string }
+            - { Name: units,     Type: int }
+            - { Name: revenue,   Type: double }
+        PartitionKeys:
+          - { Name: load_year,  Type: string }
+          - { Name: load_month, Type: string }
+
+  # ---- Views ----
+  # CloudFormation has NO clean native "Athena view" primitive. Two defensible patterns:
+  #   (a) AWS::Glue::Table with TableType: VIRTUAL_VIEW + a base64-encoded Presto/Trino
+  #       ViewOriginalText — fully declarative, but the encoding is fiddly and brittle.
+  #   (b) Store the CREATE VIEW DDL as a NamedQuery (below) and EXECUTE it at deploy
+  #       time via a custom-resource Lambda. More moving parts, far more readable.
+  # This skeleton uses (b). Note: a NamedQuery only *saves* the SQL — it does not run
+  # it, so the materializer Lambda is what actually creates the view on deploy.
+
+  # =========================================================
+  # 3. ETL — Glue job (raw -> curated Parquet)
+  # =========================================================
+  IngestionGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-ingest-${Environment}"
+      GlueVersion: "4.0"
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${CuratedZoneBucket}/scripts/ingest.py"
+      DefaultArguments:
+        "--RAW_BUCKET": !Ref RawZoneBucket
+        "--CURATED_BUCKET": !Ref CuratedZoneBucket
+        "--job-language": python
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+  # =========================================================
+  # 4. Query — Athena workgroup + view DDL stored as a NamedQuery
+  # =========================================================
+  AnalyticsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-wg-${Environment}"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true   # forces results location + cost limits
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/wg/"
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+  SalesByRegionViewDDL:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: !Sub "${ProjectName}_create_sales_by_region"
+      Database: !Ref AnalyticsDatabase
+      WorkGroup: !Ref AnalyticsWorkGroup
+      QueryString: !Sub |
+        CREATE OR REPLACE VIEW sales_by_region AS
+        SELECT region,
+               date_trunc('month', sale_date) AS sales_month,
+               SUM(revenue) AS total_revenue,
+               SUM(units)   AS total_units
+        FROM "${AnalyticsDatabase}".sales_curated
+        GROUP BY 1, 2;
+
+  # =========================================================
+  # 5. Data-quality gate — SAM-native serverless function
+  # =========================================================
+  DataQualityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-dq-${Environment}"
+      CodeUri: src/data_quality/        # app.handler: row-count / null / freshness checks
+      Handler: app.handler
+      Policies:
+        - AthenaFullAccessPolicy: {}      # tighten to specific workgroup/db in prod
+        - S3ReadPolicy: { BucketName: !Ref CuratedZoneBucket }
+      Environment:
+        Variables:
+          WORKGROUP: !Ref AnalyticsWorkGroup
+          DATABASE: !Ref AnalyticsDatabase
+      # Wire to Glue job completion via EventBridge so the pipeline fails loudly
+      # when curated data doesn't pass checks:
+      # Events:
+      #   GlueJobComplete:
+      #     Type: EventBridgeRule
+      #     Properties:
+      #       Pattern:
+      #         source: [aws.glue]
+      #         detail-type: ["Glue Job State Change"]
+      #         detail: { state: [SUCCEEDED], jobName: [!Ref IngestionGlueJob] }
+
+  # =========================================================
+  # 6. IAM — Glue job execution role (least-privilege starter)
+  # =========================================================
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: curated-rw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawZoneBucket.Arn
+                  - !Sub "${RawZoneBucket.Arn}/*"
+                  - !GetAtt CuratedZoneBucket.Arn
+                  - !Sub "${CuratedZoneBucket.Arn}/*"
+
+Outputs:
+  WorkGroupName:
+    Value: !Ref AnalyticsWorkGroup
+  GlueDatabase:
+    Value: !Ref AnalyticsDatabase
+  CuratedBucket:
+    Value: !Ref CuratedZoneBucket

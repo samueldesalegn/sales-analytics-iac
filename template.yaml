@@ -244,3 +244,7 @@ Outputs:
     Value: !Ref AnalyticsDatabase
   CuratedBucket:
     Value: !Ref CuratedZoneBucket
+  RawBucket:
+    Value: !Ref RawZoneBucket
+  GlueJobName:
+    Value: !Ref IngestionGlueJob

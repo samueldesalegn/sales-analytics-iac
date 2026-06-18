@@ -1,0 +1,7 @@
+sale_id,sale_date,region,product,units,revenue
+S001,2026-06-18,North,Widget,3,59.97
+S002,2026-06-17,South,Gadget,1,19.99
+S003,2026-06-10,East,Widget,5,99.95
+S004,2026-05-22,West,Gizmo,2,44.50
+S005,2026-05-03,North,Gadget,4,79.96
+S006,2026-06-15,South,Widget,1,19.99

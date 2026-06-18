@@ -27,14 +27,14 @@ CloudFormation, so the resources mix freely.
 ├── template.yaml              # SAM template — the whole ingestion→Athena backend
 ├── samconfig.toml             # per-environment deploy config (dev/staging/prod)
 ├── src/
-│   └── data_quality/          # SAM-native Lambda: row-count / null / freshness checks
-│       ├── app.py
-│       └── requirements.txt
+│   └── data_quality/          # SAM-native Lambda: generic check runner
+│       ├── app.py             #   discovers + runs every checks/*.sql, fails on any false
+│       ├── requirements.txt
+│       └── checks/            #   one .sql per check; each returns: passed (bool), detail
 ├── glue/
 │   └── ingest.py              # Glue ETL script (uploaded to S3, referenced by the job)
 ├── sql/
-│   ├── views/                 # Athena view DDL (CREATE OR REPLACE VIEW ...)
-│   └── checks/                # data-quality query suite (run by the Lambda)
+│   └── views/                 # Athena view DDL (CREATE OR REPLACE VIEW ...)
 └── .github/
     └── workflows/
         └── ci.yml             # validate → lint → build → deploy

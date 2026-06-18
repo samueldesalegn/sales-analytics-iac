@@ -160,8 +160,41 @@ Resources:
       CodeUri: src/data_quality/        # app.handler: row-count / null / freshness checks
       Handler: app.handler
       Policies:
-        - AthenaFullAccessPolicy: {}      # tighten to specific workgroup/db in prod
-        - S3ReadPolicy: { BucketName: !Ref CuratedZoneBucket }
+        # SAM policy template — valid, reads the curated source data.
+        - S3ReadPolicy:
+            BucketName: !Ref CuratedZoneBucket
+        # There is NO SAM policy template for Athena, so grant it as an inline,
+        # workgroup-scoped IAM policy document (allowed alongside SAM templates).
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AthenaQuery
+              Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - athena:StopQueryExecution
+              Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AnalyticsWorkGroup}"
+            - Sid: GlueCatalogRead
+              Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:GetDatabase
+                - glue:GetPartitions
+              Resource:
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${AnalyticsDatabase}"
+                - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${AnalyticsDatabase}/*"
+            - Sid: AthenaResultsReadWrite
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource:
+                - !GetAtt AthenaResultsBucket.Arn
+                - !Sub "${AthenaResultsBucket.Arn}/*"
       Environment:
         Variables:
           WORKGROUP: !Ref AnalyticsWorkGroup

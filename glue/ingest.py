@@ -1,9 +1,10 @@
-"""Glue ETL: raw CSV landing -> curated Parquet (partitioned).
+"""Glue ETL: raw CSV landing -> curated Parquet (partitioned, dashboard-ready).
 
 Reads --RAW_BUCKET / --CURATED_BUCKET from job args (set in template.yaml),
-cleans and typecasts to the curated schema, derives year/month partition
-columns from sale_date (so Athena can prune by date), and writes Snappy
-Parquet to the curated zone that the `sales_curated` external table reads.
+typecasts the raw fields, derives the measures a BI layer needs
+(revenue, cost, profit) from units/unit_price/unit_cost, partitions by
+year/month from sale_date, and writes Snappy Parquet to the curated zone
+that the `sales_curated` external table reads.
 """
 import sys
 
@@ -31,26 +32,38 @@ raw = (
     .csv(raw_path)
 )
 
-# 2. clean / typecast to the curated schema
+# 2. clean / typecast the raw columns
 clean = (
     raw
     .withColumn("sale_id", F.col("sale_id").cast("string"))
     .withColumn("sale_date", F.to_date(F.col("sale_date")))
     .withColumn("region", F.trim(F.col("region")))
+    .withColumn("channel", F.trim(F.col("channel")))
+    .withColumn("category", F.trim(F.col("category")))
     .withColumn("product", F.trim(F.col("product")))
+    .withColumn("customer_segment", F.trim(F.col("customer_segment")))
     .withColumn("units", F.col("units").cast("int"))
-    .withColumn("revenue", F.col("revenue").cast("double"))
+    .withColumn("unit_price", F.col("unit_price").cast("double"))
+    .withColumn("unit_cost", F.col("unit_cost").cast("double"))
     .where(F.col("sale_id").isNotNull() & F.col("sale_date").isNotNull())
 )
 
-# 3. derive partition columns from sale_date (enables Athena partition pruning)
-partitioned = (
+# 3. derive the measures the dashboards compare
+enriched = (
     clean
+    .withColumn("revenue", F.round(F.col("units") * F.col("unit_price"), 2))
+    .withColumn("cost",    F.round(F.col("units") * F.col("unit_cost"), 2))
+    .withColumn("profit",  F.round(F.col("units") * (F.col("unit_price") - F.col("unit_cost")), 2))
+)
+
+# 4. derive partition columns from sale_date (enables Athena partition pruning)
+partitioned = (
+    enriched
     .withColumn("load_year", F.year("sale_date").cast("string"))
     .withColumn("load_month", F.lpad(F.month("sale_date").cast("string"), 2, "0"))
 )
 
-# 4. write Snappy Parquet, partitioned, to the curated zone
+# 5. write Snappy Parquet, partitioned, to the curated zone
 (
     partitioned.write
     .mode("overwrite")
